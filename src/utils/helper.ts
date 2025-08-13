@@ -31,3 +31,16 @@ export function isSelectedIndex(
 export function dayIndexOf(days: Moment[], dateStr: string) {
   return days.findIndex((d) => d.isSame(moment(dateStr), "day"));
 }
+
+export function debounce<T extends (...args: string[]) => void>(
+  func: T,
+  delay: number
+) {
+  let timer: ReturnType<typeof setTimeout>;
+  return (...args: Parameters<T>) => {
+    clearTimeout(timer);
+    timer = setTimeout(() => {
+      func(...args);
+    }, delay);
+  };
+}
