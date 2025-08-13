@@ -1,74 +1,102 @@
 import moment from "moment-timezone";
-import React, { type ChangeEvent, type JSX } from "react";
-import { dayIndexOf, getMonthDays, isSelectedIndex } from "../utils/helper";
+import React, { type ChangeEvent, type FormEvent, type JSX } from "react";
+import { getMonthDays, isSelectedIndex } from "../utils/helper";
 import {
   DndContext,
   PointerSensor,
-  useDraggable,
   useSensor,
   useSensors,
+  type DataRef,
   type DragEndEvent,
   type DragMoveEvent,
   type DragStartEvent,
 } from "@dnd-kit/core";
 import { Inputs } from "./input";
-
-interface Task {
-  id: string;
-  name: string;
-  startDate: string;
-  endDate: string;
-}
+import CurdContext from "../context/useCrudContext";
+import { toast } from "sonner";
+import { TaskDraggable } from "./taskbar";
 
 export const Calendar: React.FC = () => {
   const today = moment();
   const days = getMonthDays(today.year(), today.month());
   moment.tz.setDefault("Asia/Kolkata");
-
+  const {
+    tasks,
+    setTasks,
+    updateTaskDate,
+    createTask,
+    searchTerm,
+    updateTasks,
+  } = React.useContext(CurdContext);
   const calendarRef = React.useRef<HTMLDivElement | null>(null);
+  const headerRef = React.useRef<HTMLDivElement | null>(null);
   const gridRef = React.useRef<HTMLDivElement | null>(null);
-  const [cellWidth, setCellWidth] = React.useState<number>(120); // fallback, will measure
 
-  // tasks state
-  const [tasks, setTasks] = React.useState<Task[]>([]);
+  const [cellWidth, setCellWidth] = React.useState<number>(120);
+  const [cellHeight, setCellHeight] = React.useState<number>(100);
+  const [headerHeight, setHeaderHeight] = React.useState<number>(50);
+
   const [isSelecting, setIsSelecting] = React.useState(false);
   const [selStartIndex, setSelStartIndex] = React.useState<number | null>(null);
   const [selEndIndex, setSelEndIndex] = React.useState<number | null>(null);
-
-  // modal state
-  const [showModal, setShowModal] = React.useState(false);
+  const [activeId, setActiveId] = React.useState<string | null>(null);
+  const [showModal, setShowModal] = React.useState<{
+    edit: boolean;
+    del: boolean;
+    create: boolean;
+  }>({
+    del: false,
+    edit: false,
+    create: false,
+  });
   const [newRange, setNewRange] = React.useState<{
     start: string;
     end: string;
   } | null>(null);
   const [taskInputs, setTaskInputs] = React.useState<{
-    taskName: string;
+    name: string;
     status: "To Do" | "In Progress" | "Review" | "Completed";
+    startDate?: string;
+    endDate?: string;
+    time?: string;
+    id?: string;
   }>({
     status: "To Do",
-    taskName: "",
+    name: "",
+    startDate: "",
+    endDate: "",
+    time: "",
+    id: "",
   });
-  const [finalRange, setFinalRange] = React.useState<{
-    start: number;
-    end: number;
-  } | null>(null);
-  console.log(finalRange);
+
+  const handleModel = (modalName: "edit" | "del" | "create") => {
+    setShowModal((preve) => ({
+      ...preve,
+      [modalName]: !preve[modalName],
+    }));
+  };
+
   // transient state for live feedback when resizing
   const [tempTaskRange, setTempTaskRange] = React.useState<
     Record<string, { start: string; end: string }>
   >({});
 
-  const [activeId, setActiveId] = React.useState<string | null>(null);
-
-  // sensors
   const sensors = useSensors(useSensor(PointerSensor));
 
-  // measure cell width on mount & when window resizes
   React.useEffect(() => {
     function measure() {
       if (!gridRef.current) return;
-      const cell = gridRef.current.querySelector<HTMLElement>("#calendar-cell");
-      if (cell) setCellWidth(cell.getBoundingClientRect().width);
+      // pick first cell by data-index attribute
+      const firstCell =
+        gridRef.current.querySelector<HTMLElement>("[data-index]");
+      if (firstCell) {
+        const r = firstCell.getBoundingClientRect();
+        setCellWidth(r.width);
+        setCellHeight(r.height);
+      }
+      if (headerRef.current) {
+        setHeaderHeight(headerRef.current.getBoundingClientRect().height);
+      }
     }
     measure();
     window.addEventListener("resize", measure);
@@ -77,25 +105,27 @@ export const Calendar: React.FC = () => {
 
   /** Drag start */
   function handleDragStart(event: DragStartEvent) {
-    setActiveId(String(event.active.id));
+    const data = (event.active?.data as DataRef<unknown>)?.current;
+    setActiveId((data && data.taskId) || String(event.active.id));
   }
 
   /** Drag move - used for resizing live feedback */
   function handleDragMove(event: DragMoveEvent) {
-    const id = String(event.active.id);
-    // handle left/right resize handles
-    if (id.endsWith("-left") || id.endsWith("-right")) {
-      const [taskId, side] = id.split("-");
+    const data = event.active?.data?.current;
+    if (!data) return;
+
+    const { type, taskId } = data as { type?: string; taskId?: string };
+    if (!type || !taskId) return;
+
+    // only handle left/right resize live preview here
+    if (type === "left" || type === "right") {
       const task = tasks.find((t) => t.id === taskId);
       if (!task) return;
-
-      // initial index and current mouse delta
-      // event.delta is cumulative delta since drag started
-      const dx = event.delta.x;
+      const dx = event.delta.x ?? event.delta.y;
       const daysChange = Math.round(dx / cellWidth);
-      if (side === "left") {
+
+      if (type === "left") {
         const newStart = moment(task.startDate).add(daysChange, "days");
-        // constrain so start <= end
         const constrainedStart = moment.min(newStart, moment(task.endDate));
         setTempTaskRange((prev) => ({
           ...prev,
@@ -120,53 +150,38 @@ export const Calendar: React.FC = () => {
 
   /** Drag end - commit move or resize */
   function handleDragEnd(event: DragEndEvent) {
-    const id = String(event.active.id);
+    const data = event.active?.data.current;
     setActiveId(null);
+    if (!data) return;
 
-    // Move whole task (id format: task-<id> or just <id>)
-    // We used draggable id as just task.id for body drags
-    const bodyTask = tasks.find((t) => t.id === id);
-    if (bodyTask) {
-      // event.delta.x gives how many px dragged
+    const { type, taskId } = data as { type?: string; taskId?: string };
+    if (!type || !taskId) return;
+
+    if (type === "body") {
       const dx = event.delta.x;
       const daysChange = Math.round(dx / cellWidth);
       if (daysChange !== 0) {
-        setTasks((prev) =>
-          prev.map((t) =>
-            t.id === bodyTask.id
-              ? {
-                  ...t,
-                  startDate: moment(t.startDate)
-                    .add(daysChange, "days")
-                    .format("YYYY-MM-DD"),
-                  endDate: moment(t.endDate)
-                    .add(daysChange, "days")
-                    .format("YYYY-MM-DD"),
-                }
-              : t
-          )
-        );
+        updateTaskDate(taskId, daysChange);
+        toast.success("Task updated Successfully");
       }
-      // done
       return;
     }
 
-    // Resize handles: ids like "<taskId>-left" or "<taskId>-right"
-    if (id.endsWith("-left") || id.endsWith("-right")) {
-      const [taskId, side] = id.split("-");
+    // Left / Right handle: commit the temp range if present, or fallback to dx compute
+    if (type === "right") {
       const task = tasks.find((t) => t.id === taskId);
       if (!task) return;
 
-      // If a temp range exists (from move), commit it; else compute from delta
       const temp = tempTaskRange[taskId];
       if (temp) {
-        setTasks((prev) =>
-          prev.map((t) =>
-            t.id === taskId
-              ? { ...t, startDate: temp.start, endDate: temp.end }
-              : t
-          )
+        const update = tasks.map((t) =>
+          t.id === taskId
+            ? { ...t, startDate: temp.start, endDate: temp.end }
+            : t
         );
+        setTasks(update);
+        localStorage.setItem("tasks", JSON.stringify(update));
+        toast.success("Task Updated Successfully.");
         setTempTaskRange((p) => {
           const copy = { ...p };
           delete copy[taskId];
@@ -175,21 +190,10 @@ export const Calendar: React.FC = () => {
         return;
       }
 
-      // fallback: compute using event.delta.x
       const dx = event.delta.x;
       const daysChange = Math.round(dx / cellWidth);
-      if (side === "left") {
-        const newStart = moment(task.startDate).add(daysChange, "days");
-        const constrainedStart = moment.min(newStart, moment(task.endDate));
-        setTasks((prev) =>
-          prev.map((t) =>
-            t.id === taskId
-              ? { ...t, startDate: constrainedStart.format("YYYY-MM-DD") }
-              : t
-          )
-        );
-      } else {
-        const newEnd = moment(task.endDate).add(daysChange, "days");
+      if (type === "right") {
+        const newEnd = moment.tz(task.endDate).add(daysChange, "days");
         const constrainedEnd = moment.max(newEnd, moment(task.startDate));
         setTasks((prev) =>
           prev.map((t) =>
@@ -201,11 +205,16 @@ export const Calendar: React.FC = () => {
       }
     }
   }
+  const filteredTasks =
+    tasks &&
+    tasks?.filter((task) =>
+      task.name.toLowerCase().includes(searchTerm.toLowerCase())
+    );
 
   function renderTasks() {
     const rows: JSX.Element[] = [];
 
-    tasks.forEach((task) => {
+    filteredTasks?.forEach((task) => {
       const temp = tempTaskRange[task.id];
       const start = moment.tz(
         temp ? temp.start : task.startDate,
@@ -213,42 +222,31 @@ export const Calendar: React.FC = () => {
       );
       const end = moment.tz(temp ? temp.end : task.endDate, "Asia/Kolkata");
 
-      let currentStart = moment(start);
+      const absoluteStartIndex = days.findIndex((d) => d.isSame(start, "day"));
+      const absoluteEndIndex = days.findIndex((d) => d.isSame(end, "day"));
+      if (absoluteStartIndex === -1 || absoluteEndIndex === -1) return;
 
-      while (currentStart.isSameOrBefore(end, "day")) {
-        const weekStart = moment(currentStart).startOf("week");
-        const weekEnd = moment(weekStart).endOf("week");
+      const left = (absoluteStartIndex % 7) * cellWidth + 4;
+      const top =
+        headerHeight +
+        Math.floor(absoluteStartIndex / 7) * (cellHeight + 2) +
+        4;
 
-        // Clamp the segment to stay inside the current week
-        const segmentStart = moment.max(currentStart, weekStart);
-        const segmentEnd = moment.min(end, weekEnd);
+      const width = (absoluteEndIndex - absoluteStartIndex + 1) * cellWidth - 8;
 
-        const startIndex = dayIndexOf(days, segmentStart.format("YYYY-MM-DD"));
-        const endIndex = dayIndexOf(days, segmentEnd.format("YYYY-MM-DD"));
-
-        if (startIndex === -1 || endIndex === -1) break;
-
-        const weekRow = Math.floor(startIndex / 7);
-        const left = (startIndex % 7) * cellWidth + 4;
-        const width = ((endIndex % 7) - (startIndex % 7) + 1) * cellWidth - 8;
-        const top = weekRow * 100 + 4; // Adjust "100" if cell height changes
-
-        rows.push(
-          <TaskDraggable
-            key={`${task.id}-${segmentStart.format("YYYY-MM-DD")}`}
-            task={task}
-            style={{ left, top, width }}
-            active={activeId === task.id}
-          />
-        );
-
-        currentStart = moment(segmentEnd).add(1, "day");
-      }
+      rows.push(
+        <TaskDraggable
+          key={task.id}
+          task={task}
+          style={{ left, top, width }}
+          active={activeId === task.id}
+          onUpdateClick={handleUpdate}
+        />
+      );
     });
 
     return rows;
   }
-
   function handlePointerDown(idx: number, e?: React.PointerEvent) {
     setIsSelecting(true);
     setSelStartIndex(idx);
@@ -262,7 +260,7 @@ export const Calendar: React.FC = () => {
       }
     }
     // clear previous finalRange/newRange
-    setFinalRange(null);
+    // setFinalRange(null);
     setNewRange(null);
   }
 
@@ -277,20 +275,14 @@ export const Calendar: React.FC = () => {
     const startIdx = Math.min(selStartIndex, selEndIndex);
     const endIdx = Math.max(selStartIndex, selEndIndex);
 
-    // Map index → actual date from `days`
     const startDate = days[startIdx].format("YYYY-MM-DD");
     const endDate = days[endIdx].format("YYYY-MM-DD");
 
-    setFinalRange({ start: startIdx, end: endIdx });
     setNewRange({ start: startDate, end: endDate });
-
-    setShowModal(true);
+    handleModel("create");
     setIsSelecting(false);
-    // setSelStartIndex(null);
-    // setSelEndIndex(null);
   }
 
-  // optional: cancel selection via Esc
   React.useEffect(() => {
     function onKey(e: KeyboardEvent) {
       if (e.key === "Escape") {
@@ -303,51 +295,55 @@ export const Calendar: React.FC = () => {
     return () => window.removeEventListener("keydown", onKey);
   }, []);
 
-  // commit task from modal
-  //   function createTaskFromModal() {
-  //     if (!newRange) return;
-  //     const id = "t" + Date.now();
-  //     setTasks((prev) => [
-  //       ...prev,
-  //       {
-  //         id,
-  //         name: taskName || "New task",
-  //         startDate: newRange.start,
-  //         endDate: newRange.end,
-  //       },
-  //     ]);
-  //     setShowModal(false);
-  //     setNewRange(null);
-  //     setSelStartIndex(null);
-  //     setSelEndIndex(null);
-  //   }
   const createTaskFromModal = () => {
     if (!newRange) return;
     const id = "t" + Date.now();
-    setTasks((prev) => [
-      ...prev,
-      {
-        id,
-        name: taskInputs.taskName || "New task",
-        startDate: newRange.start,
-        endDate: newRange.end,
-        status: taskInputs.status,
-      },
-    ]);
-    setShowModal(false);
+
+    createTask(id, newRange, taskInputs);
+
+    setShowModal((pre) => ({
+      ...pre,
+      create: false,
+    }));
     setTaskInputs({
       status: "To Do",
-      taskName: "",
+      name: "",
     });
   };
-  // simple cancel
-  function cancelCreate() {
-    setShowModal(false);
+
+  function cancelCreate(params: "del" | "edit" | "create") {
+    handleModel(params);
     setNewRange(null);
     setSelStartIndex(null);
     setSelEndIndex(null);
+    setTaskInputs((pre) => ({
+      ...pre,
+      endDate: "",
+      name: "",
+      startDate: "",
+      status: "To Do",
+      time: "",
+    }));
   }
-  console.log(tasks);
+
+  const handleUpdate = (id: string) => {
+    const find = tasks.find((item) => item.id === id);
+
+    if (!find) {
+      toast.error("Task not found!");
+      return;
+    }
+
+    setTaskInputs({
+      name: find?.name,
+      status: find?.status,
+      startDate: find.startDate,
+      endDate: find.endDate,
+      id: find.id,
+    });
+    handleModel("edit");
+  };
+
   const handleInputChange = (
     e: ChangeEvent<HTMLInputElement | HTMLSelectElement>
   ) => {
@@ -357,9 +353,27 @@ export const Calendar: React.FC = () => {
       [name]: value,
     }));
   };
+
+  const handleUpdateTask = (e: FormEvent) => {
+    e.preventDefault();
+    const data = {
+      id: taskInputs.id ?? "",
+      startDate: taskInputs.startDate ?? "",
+      endDate: taskInputs.endDate ?? "",
+      name: taskInputs.name ?? "",
+      status: taskInputs.status ?? "",
+    };
+    updateTasks(data);
+    toast.success("Updated");
+    handleModel("edit");
+  };
+
   return (
     <div className="relative w-full max-w-full select-none" ref={calendarRef}>
-      <div className="grid grid-cols-7 gap-2 mb-4 text-center text-sm font-medium text-gray-600">
+      <div
+        ref={headerRef}
+        className="grid grid-cols-7 gap-2 mb-4 text-center text-sm font-medium text-gray-600"
+      >
         {["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"].map((d) => (
           <div
             key={d}
@@ -371,32 +385,39 @@ export const Calendar: React.FC = () => {
       </div>
 
       <div ref={gridRef} className="grid grid-cols-7 w-full bg-[#d1d5db]">
-        {days.map((d, i) => {
-          //   const isToday =
-          //     d.isSame(moment(), "day") && d.month() === today.month();
-          const inCurrentMonth = d.month() === today.month();
-          const selected = isSelectedIndex(selStartIndex, selEndIndex, i);
-          return (
-            <div
-              key={i}
-              data-index={i}
-              //   pointer events:
-              onPointerDown={() => handlePointerDown(i)}
-              onPointerEnter={() => handlePointerEnter(i)}
-              onPointerUp={handlePointerUp}
-              className={`min-h-[100px] p-3 relative bg-white border border-gray-200 ${
-                inCurrentMonth ? "" : "bg-gray-50 text-gray-400"
-              }`}
-            >
-              <div className="text-xs text-gray-700">{d.date()}</div>
+        {days &&
+          days.map((d, i) => {
+            const isToday =
+              d.isSame(moment(), "day") && d.month() === today.month();
+            const inCurrentMonth = d.month() === today.month();
+            const selected = isSelectedIndex(selStartIndex, selEndIndex, i);
+            return (
+              <div
+                key={i}
+                data-index={i}
+                //   pointer events:
+                onPointerDown={() => handlePointerDown(i)}
+                onPointerEnter={() => handlePointerEnter(i)}
+                onPointerUp={handlePointerUp}
+                className={`min-h-[100px] relative bg-white border border-gray-200 ${
+                  inCurrentMonth ? "" : "bg-gray-50 text-gray-400"
+                }`}
+              >
+                <div
+                  className={`w-full h-full p-2 ${
+                    isToday ? "bg-red-400/50" : ""
+                  } ${inCurrentMonth ? "bg-gray-100" : "bg-white"}`}
+                >
+                  {d.date()}
+                </div>
 
-              {/* simple highlight for selection */}
-              {selected && (
-                <div className="absolute inset-0 bg-blue-200/50 pointer-events-none rounded-sm" />
-              )}
-            </div>
-          );
-        })}
+                {/* simple highlight for selection */}
+                {selected && (
+                  <div className="absolute inset-0 top-10 rounded-full bg-blue-200/50 h-6" />
+                )}
+              </div>
+            );
+          })}
       </div>
 
       {/* tasks layer overlay */}
@@ -406,12 +427,19 @@ export const Calendar: React.FC = () => {
         onDragMove={handleDragMove}
         onDragEnd={handleDragEnd}
       >
-        <div className="absolute inset-0 top-1/6 pointer-events-none">
+        <div
+          style={{
+            position: "absolute",
+            left: 0,
+            right: 0,
+            top: headerHeight,
+          }}
+        >
           {renderTasks()}
         </div>
       </DndContext>
       {/* Simple modal */}
-      {showModal && newRange && (
+      {showModal.create && newRange && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30">
           <div className="bg-white rounded p-6 w-[420px]">
             <h3 className="text-lg font-semibold mb-2">Create task</h3>
@@ -420,12 +448,12 @@ export const Calendar: React.FC = () => {
             </p>
             <form autoComplete="off" noValidate>
               <Inputs
-                value={taskInputs.taskName}
+                value={taskInputs.name}
                 onChange={handleInputChange}
                 placeholder="Task name"
                 className="w-full border px-3 py-2 rounded mb-3"
-                name="taskName"
-                id="taskName"
+                name="name"
+                id="name"
               />
 
               <select
@@ -446,7 +474,7 @@ export const Calendar: React.FC = () => {
               </select>
               <div className="flex justify-end gap-2">
                 <button
-                  onClick={cancelCreate}
+                  onClick={() => cancelCreate("create")}
                   className="px-3 py-2 border rounded"
                 >
                   Cancel
@@ -462,84 +490,97 @@ export const Calendar: React.FC = () => {
           </div>
         </div>
       )}
+
+      {showModal.edit && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30">
+          <div className="bg-white rounded p-6 w-[420px]">
+            <h3 className="text-lg font-semibold mb-2">Update Task</h3>
+            <p className="text-sm text-gray-600 mb-4">
+              {taskInputs.startDate} → {taskInputs.endDate}
+            </p>
+            <form autoComplete="off" noValidate>
+              <Inputs
+                type="text"
+                value={taskInputs.name}
+                onChange={handleInputChange}
+                placeholder="Task name"
+                className="w-full border px-3 py-2 rounded mb-3"
+                name="name"
+                id="name"
+              />
+
+              <select
+                className="w-full border px-3 py-2 rounded mb-3"
+                value={taskInputs.status}
+                name="status"
+                id="status"
+                onChange={handleInputChange}
+              >
+                <option value="" selected>
+                  --Select Category--
+                </option>
+                {["To Do", "In Progress", "Review", "Completed"].map((it) => (
+                  <option value={it} key={it}>
+                    {it}
+                  </option>
+                ))}
+              </select>
+
+              <Inputs
+                value={taskInputs.time}
+                onChange={handleInputChange}
+                className="w-full border px-3 py-2 rounded mb-3"
+                name="time"
+                id="time"
+                type="time"
+              />
+              <Inputs
+                value={
+                  taskInputs.startDate
+                    ? moment(taskInputs.startDate).format("YYYY-MM-DD")
+                    : ""
+                }
+                onChange={handleInputChange}
+                placeholder="Task name"
+                className="w-full border px-3 py-2 rounded mb-3"
+                name="startDate"
+                id="startDate"
+                type="date"
+                title="Start Date"
+              />
+              <Inputs
+                value={
+                  taskInputs.endDate
+                    ? moment(taskInputs.endDate).format("YYYY-MM-DD")
+                    : ""
+                }
+                onChange={handleInputChange}
+                placeholder="End Date"
+                className="w-full border px-3 py-2 rounded mb-3"
+                name="endDate"
+                id="endDate"
+                type="date"
+                title="End Date"
+              />
+
+              <div className="flex justify-end gap-2">
+                <button
+                  onClick={() => cancelCreate("edit")}
+                  className="px-3 py-2 border rounded"
+                >
+                  Cancel
+                </button>
+                <button
+                  onClick={handleUpdateTask}
+                  className="px-3 py-2 bg-blue-600 text-white rounded"
+                >
+                  Update
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
     </div>
   );
 };
-
-/** TaskDraggable component combines body + left/right handles as separate draggables */
-function TaskDraggable({
-  task,
-  style,
-  active,
-}: {
-  task: Task;
-  style: { left: number; top: number; width: number };
-  active?: boolean;
-}) {
-  const { attributes, listeners, setNodeRef, transform } = useDraggable({
-    id: task.id,
-    data: { type: "body", taskId: task.id },
-  });
-
-  const {
-    attributes: leftAttrs,
-    listeners: leftListeners,
-    setNodeRef: leftRef,
-  } = useDraggable({
-    id: `${task.id}-left`,
-    data: { type: "left", taskId: task.id },
-  });
-
-  const {
-    attributes: rightAttrs,
-    listeners: rightListeners,
-    setNodeRef: rightRef,
-  } = useDraggable({
-    id: `${task.id}-right`,
-    data: { type: "right", taskId: task.id },
-  });
-
-  const transformStyle = transform
-    ? {
-        transform: `translate3d(${transform.x}px, ${transform.y}px, 0)`,
-      }
-    : undefined;
-
-  return (
-    <div
-      ref={setNodeRef}
-      {...attributes}
-      {...listeners}
-      className={`absolute h-6 bg-[#2563eb] text-white flex items-center rounded-sm text-sm cursor-grab pointer-events-auto select-none ${
-        active ? "opacity-90 shadow-lg" : ""
-      }`}
-      style={{
-        left: style.left,
-        top: style.top,
-        width: style.width,
-        ...transformStyle,
-      }}
-    >
-      {/* Left handle */}
-      <div
-        ref={leftRef}
-        {...leftAttrs}
-        {...leftListeners}
-        className="h-full cursor-ew-resize bg-black/30 rounded-l-sm flex-shrink-0 w-[10px]"
-        title="Drag left to change start date"
-      />
-
-      {/* Task name */}
-      <div className="flex-1/2 px-2 truncate">{task.name}</div>
-
-      {/* Right handle */}
-      <div
-        ref={rightRef}
-        {...rightAttrs}
-        {...rightListeners}
-        className="h-full cursor-ew-resize bg-black/30 rounded-r-sm flex-shrink-0 w-[10px]"
-        title="Drag right to change end date"
-      />
-    </div>
-  );
-}
